@@ -1,0 +1,260 @@
+#include <mega128.h>
+#include <delay.h>
+#include <string.h>
+#include <stdlib.h>
+#include <eeprom.h>
+
+#define RELAY_BATT_ON   PORTA &= ~0x01
+#define RELAY_BATT_OFF  PORTA |=  0x01
+#define RELAY_ADAP_ON   PORTA &= ~0x02
+#define RELAY_ADAP_OFF  PORTA |=  0x02
+#define MOSFET_ON       PORTA |=  0x04
+#define MOSFET_OFF      PORTA &= ~0x04
+
+#define EE_MAGIC  0x00
+#define EE_ON_H   0x01
+#define EE_ON_M   0x02
+#define EE_OFF_H  0x03
+#define EE_OFF_M  0x04
+
+unsigned char target_leds       = 0x00;
+unsigned char is_auto_mode      = 0;
+unsigned char is_using_adapter  = 0;
+unsigned char servo_manual_mode = 0;
+unsigned char relay_manual_mode   = 0;
+unsigned char current_relay_state = 99;
+unsigned char relay_request = 0;
+
+unsigned char res_on_h  = 18, res_on_m  = 0;
+unsigned char res_off_h =  6, res_off_m = 0;
+unsigned char curr_h = 0, curr_m = 0, curr_s = 0;
+
+char          rx_buf[30];
+unsigned char rx_idx = 0;
+
+unsigned char get_batt_level_led(unsigned int adc) {
+    if      (adc >= 390) return 0x07;
+    else if (adc >= 360) return 0x03;
+    else if (adc >= 320) return 0x01;
+    else                 return 0x00;
+}
+
+void save_schedule(void) {
+    eeprom_write_byte(EE_ON_H,  res_on_h);
+    eeprom_write_byte(EE_ON_M,  res_on_m);
+    eeprom_write_byte(EE_OFF_H, res_off_h);
+    eeprom_write_byte(EE_OFF_M, res_off_m);
+    eeprom_write_byte(EE_MAGIC, 0xAA);
+}
+
+void load_schedule(void) {
+    if (eeprom_read_byte(EE_MAGIC) == 0xAA) {
+        res_on_h  = eeprom_read_byte(EE_ON_H);
+        res_on_m  = eeprom_read_byte(EE_ON_M);
+        res_off_h = eeprom_read_byte(EE_OFF_H);
+        res_off_m = eeprom_read_byte(EE_OFF_M);
+    }
+}
+
+void my_i2c_init(void)  { TWBR = 72; }
+void my_i2c_start(void) { TWCR = (1<<TWINT)|(1<<TWSTA)|(1<<TWEN); while(!(TWCR & (1<<TWINT))); }
+void my_i2c_stop(void)  { TWCR = (1<<TWINT)|(1<<TWSTO)|(1<<TWEN); }
+void my_i2c_write(unsigned char data) {
+    TWDR = data; TWCR = (1<<TWINT)|(1<<TWEN); while(!(TWCR & (1<<TWINT)));
+}
+unsigned char my_i2c_read_ack(void)  { TWCR = (1<<TWINT)|(1<<TWEA)|(1<<TWEN); while(!(TWCR & (1<<TWINT))); return TWDR; }
+unsigned char my_i2c_read_nack(void) { TWCR = (1<<TWINT)|(1<<TWEN);             while(!(TWCR & (1<<TWINT))); return TWDR; }
+
+unsigned char bcd_to_dec(unsigned char bcd) { return ((bcd >> 4) * 10) + (bcd & 0x0F); }
+unsigned char dec_to_bcd(unsigned char dec) { return ((dec / 10) << 4) | (dec % 10); }
+
+void set_rtc_time(unsigned char h, unsigned char m, unsigned char s) {
+    my_i2c_start(); my_i2c_write(0xD0); my_i2c_write(0x00);
+    my_i2c_write(dec_to_bcd(s));
+    my_i2c_write(dec_to_bcd(m));
+    my_i2c_write(dec_to_bcd(h));
+    my_i2c_stop();
+}
+
+void get_rtc_time(void) {
+    unsigned char tmp_s, tmp_m, tmp_h;
+    my_i2c_start(); my_i2c_write(0xD0); my_i2c_write(0x00);
+    my_i2c_start(); my_i2c_write(0xD1);
+    tmp_s = bcd_to_dec(my_i2c_read_ack()  & 0x7F);
+    tmp_m = bcd_to_dec(my_i2c_read_ack()  & 0x7F);
+    tmp_h = bcd_to_dec(my_i2c_read_nack() & 0x3F);
+    my_i2c_stop();
+
+    if (tmp_h <= 23 && tmp_m <= 59 && tmp_s <= 59) {
+        curr_s = tmp_s; curr_m = tmp_m; curr_h = tmp_h;
+    }
+}
+
+void uart1_init(void) { UCSR1B = 0x98; UBRR1L = 103; }
+void uart1_print(char *str) {
+    while (*str) { while (!(UCSR1A & (1<<UDRE1))); UDR1 = *str++; }
+}
+
+void uart_send_num(long n) {
+    char buf[10];
+    unsigned char i = 0;
+    if (n < 0) { uart1_print("-"); n = -n; }
+    if (n == 0) { while (!(UCSR1A & (1<<UDRE1))); UDR1 = '0'; return; }
+    while(n > 0) { buf[i++] = (n % 10) + '0'; n /= 10; }
+    while(i > 0) { while (!(UCSR1A & (1<<UDRE1))); UDR1 = buf[--i]; }
+}
+
+void uart_send_num_2digit(unsigned char n) {
+    unsigned char d1 = n / 10;
+    unsigned char d2 = n % 10;
+    while (!(UCSR1A & (1<<UDRE1))); UDR1 = d1 + '0';
+    while (!(UCSR1A & (1<<UDRE1))); UDR1 = d2 + '0';
+}
+
+interrupt [USART1_RXC] void usart1_rx_isr(void) {
+    char data = UDR1;
+    unsigned char h, m, s;
+
+    if (data == '\n' || rx_idx >= 29) {
+        rx_buf[rx_idx] = '\0';
+        if (strncmp(rx_buf, "MODE:AUTO", 9) == 0) { is_auto_mode = 1; relay_request = 0; uart1_print("OK:AUTO\r\n"); }
+        else if (strncmp(rx_buf, "MODE:MANUAL", 11) == 0) { is_auto_mode = 0; relay_request = 0; uart1_print("OK:MANUAL\r\n"); }
+        else if (strncmp(rx_buf, "LED:", 4) == 0) {
+            target_leds = 0;
+            if (rx_buf[4] == '1') target_leds |= 0x01;
+            if (rx_buf[5] == '1') target_leds |= 0x02;
+            if (rx_buf[6] == '1') target_leds |= 0x04;
+            if (rx_buf[7] == '1') target_leds |= 0x08;
+            relay_request = (target_leds > 0) ? 1 : 0;
+            uart1_print("OK:LED_SYNC\r\n");
+        }
+        else if (strncmp(rx_buf, "SRV:L", 5) == 0) { servo_manual_mode = 1; OCR1B = 1500; uart1_print("OK:SRV_L\r\n"); }
+        else if (strncmp(rx_buf, "SRV:C", 5) == 0) { servo_manual_mode = 1; OCR1B = 3000; uart1_print("OK:SRV_C\r\n"); }
+        else if (strncmp(rx_buf, "SRV:R", 5) == 0) { servo_manual_mode = 1; OCR1B = 4500; uart1_print("OK:SRV_R\r\n"); }
+        else if (strncmp(rx_buf, "SRV:AUTO", 8) == 0) { servo_manual_mode = 0; uart1_print("OK:SRV_AUTO\r\n"); }
+        else if (strncmp(rx_buf, "RLY:AUTO", 8) == 0) { relay_manual_mode = 0; uart1_print("OK:RLY_AUTO\r\n"); }
+        else if (strncmp(rx_buf, "RLY:IN1",  7) == 0) { relay_manual_mode = 1; uart1_print("OK:RLY_IN1\r\n"); }
+        else if (strncmp(rx_buf, "RLY:IN2",  7) == 0) { relay_manual_mode = 2; uart1_print("OK:RLY_IN2\r\n"); }
+        else if (strncmp(rx_buf, "RLY:OFF",  7) == 0) { relay_manual_mode = 3; uart1_print("OK:RLY_OFF\r\n"); }
+        else if (strncmp(rx_buf, "SYNC:", 5) == 0) {
+            h = (rx_buf[5]-'0')*10 + (rx_buf[6]-'0');
+            m = (rx_buf[7]-'0')*10 + (rx_buf[8]-'0');
+            s = (rx_buf[9]-'0')*10 + (rx_buf[10]-'0');
+            set_rtc_time(h, m, s);
+            uart1_print("OK:TIME_SYNC\r\n");
+        }
+        else if (strncmp(rx_buf, "RES:", 4) == 0) {
+            res_on_h  = (rx_buf[4]-'0')*10 + (rx_buf[5]-'0');
+            res_on_m  = (rx_buf[6]-'0')*10 + (rx_buf[7]-'0');
+            if (rx_buf[8] >= '0' && rx_buf[8] <= '9') { 
+                res_off_h = (rx_buf[8]-'0')*10 + (rx_buf[9]-'0');
+                res_off_m = (rx_buf[10]-'0')*10 + (rx_buf[11]-'0');
+            } else { 
+                res_off_h = (rx_buf[9]-'0')*10 + (rx_buf[10]-'0');
+                res_off_m = (rx_buf[11]-'0')*10 + (rx_buf[12]-'0');
+            }
+            save_schedule();
+            is_auto_mode = 1; relay_manual_mode = 0; 
+            uart1_print("OK:RESERVED\r\n");
+        }
+        rx_idx = 0;
+    } else { rx_buf[rx_idx++] = data; }
+}
+
+unsigned int read_adc(unsigned char ch) {
+    ADMUX = 0x40 | (ch & 0x07); delay_us(10); ADCSRA |= 0x40;
+    while ((ADCSRA & 0x10) == 0); ADCSRA |= 0x10; return ADCW;
+}
+
+void init_system(void) {
+    DDRA  = 0x07; PORTA = 0x03;
+    DDRC  = 0x0F; PORTC = 0x00;
+    DDRB |= 0x40;
+    TCCR1A = 0x22; TCCR1B = 0x1A; ICR1 = 39999; 
+    OCR1B = 3000; // ? 초기값 복구 (부팅 시 튐 방지)
+    ADMUX = 0x40; ADCSRA = 0x87;
+    uart1_init(); my_i2c_init(); #asm("sei")
+}
+
+void main(void) {
+    unsigned int  cds_pf0, cds_pf1, batt_adc, tx_cnt = 0, servo_cnt = 0;
+    long          servo_sum_diff = 0, servo_avg_diff = 0, sum_diff = 0;
+    int           diff;
+    unsigned char is_led_time, prev_led_time = 0, power_on_flag = 0;
+    unsigned char dashboard_leds, target_relay_state = 0;
+    unsigned int  relay_force_cnt = 0;
+    long          new_ocr;
+    unsigned int  c_t, o_t, f_t;
+
+    init_system(); load_schedule();
+
+    while (1) {
+        batt_adc = read_adc(2); cds_pf0 = read_adc(0); cds_pf1 = read_adc(1);
+        get_rtc_time();
+
+        if (is_using_adapter == 0) { if (batt_adc <= 300) is_using_adapter = 1; }
+        else                       { if (batt_adc >= 390) is_using_adapter = 0; }
+
+        dashboard_leds = get_batt_level_led(batt_adc) & 0x07;
+        if ((relay_manual_mode == 0 && is_using_adapter) || (relay_manual_mode == 2)) dashboard_leds |= 0x08;
+        PORTC = (PORTC & 0xF0) | (dashboard_leds & 0x0F);
+
+        c_t = curr_h * 60 + curr_m; o_t = res_on_h * 60 + res_on_m; f_t = res_off_h * 60 + res_off_m;
+        is_led_time = (o_t > f_t) ? (c_t >= o_t || c_t < f_t) : (c_t >= o_t && c_t < f_t);
+
+        if (is_auto_mode == 1) {
+            if      (prev_led_time == 0 && is_led_time == 1) target_leds = 0x0F;
+            else if (prev_led_time == 1 && is_led_time == 0) target_leds = 0x00;
+        }
+        prev_led_time = is_led_time;
+
+        power_on_flag = (is_auto_mode == 1) ? is_led_time : relay_request;
+
+        if (relay_manual_mode == 0) target_relay_state = power_on_flag ? (is_using_adapter ? 2 : 1) : 0;
+        else if (relay_manual_mode == 1) target_relay_state = 1;
+        else if (relay_manual_mode == 2) target_relay_state = 2;
+        else target_relay_state = 0;
+
+        if (current_relay_state != target_relay_state) {
+            RELAY_BATT_OFF; RELAY_ADAP_OFF; MOSFET_OFF; delay_ms(30);
+            if      (target_relay_state == 1) { MOSFET_ON; delay_ms(10); RELAY_BATT_ON; }
+            else if (target_relay_state == 2) { RELAY_ADAP_ON; }
+            current_relay_state = target_relay_state;
+            relay_force_cnt = 0;
+        } else if (++relay_force_cnt >= 100) {
+            relay_force_cnt = 0;
+            if      (target_relay_state == 1) { MOSFET_ON; RELAY_BATT_ON; RELAY_ADAP_OFF; }
+            else if (target_relay_state == 2) { MOSFET_OFF; RELAY_ADAP_ON; RELAY_BATT_OFF; }
+            else                              { MOSFET_OFF; RELAY_BATT_OFF; RELAY_ADAP_OFF; }
+        }
+
+        diff = (int)cds_pf0 - (int)cds_pf1;
+        sum_diff += diff; servo_sum_diff += diff;
+
+        if (++tx_cnt >= 10) {
+            uart1_print("TIME:"); uart_send_num_2digit(curr_h); uart1_print(":"); uart_send_num_2digit(curr_m); uart1_print(":"); uart_send_num_2digit(curr_s);
+            uart1_print(",BAT:"); uart_send_num(batt_adc); uart1_print(",L:"); uart_send_num(cds_pf0); uart1_print(",R:"); uart_send_num(cds_pf1);
+            uart1_print(",ADP:"); uart_send_num(is_using_adapter); uart1_print(",LED:"); uart_send_num((target_leds & 0x01) ? 1 : 0);
+            uart_send_num((target_leds & 0x02) ? 1 : 0); uart_send_num((target_leds & 0x04) ? 1 : 0); uart_send_num((target_leds & 0x08) ? 1 : 0);
+            uart1_print(",MOD:"); uart_send_num(is_auto_mode); uart1_print("\n");
+            sum_diff = 0; tx_cnt = 0;
+        }
+
+        if (++servo_cnt >= 20) {
+            servo_avg_diff = servo_sum_diff / 20;
+            if (servo_manual_mode == 0) {
+                // ? 데드밴드 150으로 확대
+                if (servo_avg_diff > 150 || servo_avg_diff < -150) {
+                    #asm("cli")
+                    new_ocr = (long)OCR1B - (servo_avg_diff / 12);
+                    if (new_ocr < 1500) new_ocr = 1500;
+                    if (new_ocr > 4500) new_ocr = 4500;
+                    OCR1B = (unsigned int)new_ocr;
+                    #asm("sei")
+                }
+            }
+            servo_sum_diff /= 2; servo_cnt = 0;
+        }
+        delay_ms(100);
+    }
+}
